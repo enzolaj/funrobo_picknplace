@@ -135,7 +135,7 @@ Usage
 
 To actually use this code, you will have to make an instance of the Main class:
 
-<var> = Main()
+[var] = Main()
 
 Then you MUST have a while True loop. This loop doesn’t have to do anything, but it keeps the background thread running which actually runs your code:
 
@@ -147,6 +147,6 @@ try:
 
 except KeyboardInterrupt:
 
-        <var>.shutdown()
+        [var].shutdown()
 
 Not only will this keep the main thread alive, but it will also allow you to exit any program running by pressing CTRL+C
