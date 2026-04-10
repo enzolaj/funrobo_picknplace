@@ -87,9 +87,9 @@ source .venv/bin/activate
 
 To verify that everything worked correctly, run:
 
-python [test.py](https://www.google.com/url?q=http://test.py&sa=D&source=editors&ust=1775837108155805&usg=AOvVaw2rDpW06vjhn5lVHA5zHs__)
+python -m backend.kinova.py
 
-NOTE: This will ONLY work if you are in the UV virtual environment, if you are not in the virtual environment (it does not say (kinova-control-system) in your terminal) either activate it by following the above instructions or run uv run python [test.py](https://www.google.com/url?q=http://test.py&sa=D&source=editors&ust=1775837108156409&usg=AOvVaw033zPMlPCjou_a_zT2727Y))
+NOTE: This will ONLY work if you are in the UV virtual environment, if you are not in the virtual environment (it does not say (kinova-control-system) in your terminal) either activate it by following the above instructions or run uv run python -m backend.kinova.py)
 
 The expected output should be:
 

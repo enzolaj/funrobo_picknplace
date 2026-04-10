@@ -177,4 +177,7 @@ class Kinova():
 if __name__ == "__main__":
     kinova = BaseKinova()
     kinova.start()
-    print("Robot ready!")
+    
+    print("Testing Environment...")
+    print("Environment is ready to go")
+    print("Have fun using the Kinova Robot Arm!")
