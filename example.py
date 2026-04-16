@@ -1,6 +1,5 @@
 from backend.kinova import BaseApp
 import numpy as np
-import queue, threading
 
 class Main(BaseApp):
         

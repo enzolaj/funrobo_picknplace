@@ -1,6 +1,5 @@
 from backend.kinova import BaseApp
 import time
-import math
 
 class Main(BaseApp):
 

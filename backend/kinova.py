@@ -396,22 +396,26 @@ class SimKinova:
             self.gripper_position = ratio
 
         if self.is_suction:
-            return 
+            return
 
         for joint in self.gripper_joints:
             info = self.p.getJointInfo(self.robot_id, joint)
-            name = info[1].decode('utf-8').lower()
-            
+            name = info[1].decode("utf-8").lower()
+
             # --- THE FIX: Hardcode the Kinova 2F Gripper kinematics ---
             # 0.0 is open (neutral origin), 1.0 is closed (extreme limit)
             if "right_bottom" in name:
-                target = ratio * 0.96    # Closes positively
+                target = ratio * 0.96  # Closes positively
             elif "left_bottom" in name:
-                target = ratio * -0.96   # Closes negatively
+                target = ratio * -0.96  # Closes negatively
             elif "right_tip" in name:
-                target = ratio * -1.03   # Bends opposite to bottom joint to stay parallel
+                target = (
+                    ratio * -1.03
+                )  # Bends opposite to bottom joint to stay parallel
             elif "left_tip" in name:
-                target = ratio * -1.03    # Bends opposite to bottom joint (axis is inverted in URDF)
+                target = (
+                    ratio * -1.03
+                )  # Bends opposite to bottom joint (axis is inverted in URDF)
             else:
                 # Generic fallback if your students load a different gripper later
                 lower, upper = info[8], info[9]
@@ -419,14 +423,14 @@ class SimKinova:
                     target = lower + ratio * (upper - lower)
                 else:
                     target = 0.0
-                    
+
             # Apply the calculated target position
             self.p.setJointMotorControl2(
-                self.robot_id, 
-                joint, 
-                self.p.POSITION_CONTROL, 
-                targetPosition=target, 
-                force=50
+                self.robot_id,
+                joint,
+                self.p.POSITION_CONTROL,
+                targetPosition=target,
+                force=50,
             )
 
     def set_joint_angles(self, angles, gripper_percentage=None, wait=True):
@@ -560,3 +564,32 @@ class BaseApp:
 
     def loop(self):
         pass
+
+
+if __name__ == "__main__":
+    import sys
+    import time
+
+    print("Testing Environment...\n")
+
+    try:
+        # Attempt to initialize the physical robot to verify the connection
+        # The docs state this only works if physically connected to the KINOVA.
+        test_robot = Kinova(simulate=False)
+
+        # Give the background thread a moment to spin up and verify connection
+        time.sleep(2)
+
+        # Safely shut down the test connection
+        test_robot.stop()
+
+        print("Environment is ready to go\n")
+        print("Have fun using the Kinova Robot Arm!")
+        sys.exit(0)
+
+    except Exception as e:
+        print("\n[ERROR] Environment test failed. Could not connect to the Kinova arm.")
+        print("Did you follow the Physical and Communication Setup sections?")
+        print("Are you inside the UV virtual environment?")
+        print(f"\nDetails: {e}")
+        sys.exit(1)
