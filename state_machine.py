@@ -12,6 +12,8 @@ STATE_APPROACH_GOAL = 3
 STATE_RELEASE = 4
 STATE_STOP = 5
 
+APPROACH_Z_OFFSET = 0.05
+
 # Parameters for Realsense Color channel, 
 RS_INTRINSIC_COLOR_640 = np.array([
     [615.21,0,310.90],[0,614.45,243.97],[0,0,1]
@@ -19,10 +21,19 @@ RS_INTRINSIC_COLOR_640 = np.array([
 
 RS_DIST_COLOR_640 = np.array([0,0,0,0,0])
 
+# Transformations for our scene
 H_CAMERA_TO_ROBOT = np.array([
     [1,0,0,0],
     [0,1,0,0],
     [0,0,1,0],
+    [0,0,0,1],
+])
+
+BLOCK_WIDTH = 0.0254
+H_TAG_TO_BLOCK_CENTER = np.array([
+    [1,0,0,BLOCK_WIDTH * 0.5],
+    [0,1,0,BLOCK_WIDTH * 0.5],
+    [0,0,1,BLOCK_WIDTH * -0.5],
     [0,0,0,1],
 ])
 
@@ -60,6 +71,8 @@ class Main(BaseApp):
         self.last_known_target_pose = None
         self.last_known_goal_pose = None
 
+        self.grab_ee_target = None # EE object that defines where to move the gripper to pick up or release
+
         self.camMatrix = RS_INTRINSIC_COLOR_640
         self.distCoeffs = RS_DIST_COLOR_640
     
@@ -92,19 +105,27 @@ class Main(BaseApp):
 
             # Map OpenCV output in the camera frame to position in the world frame
             pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_target_pose[1],rvecs=self.last_known_target_pose[0])
+            target_pose = self.get_approach_pose(pose_robot_frame)
 
             # go towards the target pose
-            ## TODO we don't want to match the pose exactly --- instead be looking downwards, and target slightly above it
-            at_target = self.go_towards_pose(pose_robot_frame, 0.1)
+            at_target = self.go_towards_pose(target_pose, 0.1)
             if at_target:
                 # we reached our target (the block)
                 self.state = STATE_GRAB
+
+                # get rid of the offset we enforce in the approach
+                target_pose_shifted = target_pose
+                target_pose_shifted.z = target_pose.z - APPROACH_Z_OFFSET
+                self.grab_ee_target = target_pose_shifted
                 print(f"Entering STATE_GRAB state")
 
         elif self.state == STATE_GRAB:
-            # Close the gripper without moving our EE pose
+            self.kinova_robot.open_gripper()
 
-            ### TODO make the robot start a little higher than the block and then advance on it
+            q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
+            q_sol = self.model.calc_inverse_kinematics(self.grab_ee_target, q_guess=q_guess)
+            q_sol = np.asarray(q_sol, dtype=float)
+            self.kinova_robot.set_joint_angles(q_sol)
 
             self.kinova_robot.close_gripper()
             self.state = STATE_APPROACH_GOAL
@@ -119,17 +140,25 @@ class Main(BaseApp):
             
             # Map OpenCV output in the camera frame to position in the world frame
             pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_goal_pose[1],rvecs=self.last_known_goal_pose[0])
+            goal_pose = self.get_approach_pose(pose_robot_frame)
 
             # go towards the target pose
             ## TODO we don't want to match the pose exactly --- instead be looking downwards, and target slightly above it
-            at_goal = self.go_towards_pose(pose_robot_frame, 0.1)
+            at_goal = self.go_towards_pose(goal_pose, 0.1)
             if at_goal:
                 # we reached our target (the block)
+                target_pose_shifted = goal_pose
+                target_pose_shifted.z = goal_pose.z - APPROACH_Z_OFFSET
+                self.grab_ee_target = target_pose_shifted
                 self.state = STATE_RELEASE
                 print(f"Entering STATE_RELEASE state")
 
         elif self.state == STATE_RELEASE:
-            # Open the gripper without moving our EE pose
+            q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
+            q_sol = self.model.calc_inverse_kinematics(self.grab_ee_target, q_guess=q_guess)
+            q_sol = np.asarray(q_sol, dtype=float)
+            self.kinova_robot.set_joint_angles(q_sol)
+
             self.kinova_robot.open_gripper()
 
             # Our old goal is covered, our new goal (if stacking multiple blocks) is our earlier target
@@ -137,6 +166,13 @@ class Main(BaseApp):
             self.target_ids.remove(self.current_target_id)
 
             ### TODO make the robot retreat a bit, go to some neutral position 
+            shifted_goal = self.grab_ee_target
+            shifted_goal.z += APPROACH_Z_OFFSET
+
+            q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
+            q_sol = self.model.calc_inverse_kinematics(self.grab_ee_target, q_guess=q_guess)
+            q_sol = np.asarray(q_sol, dtype=float)
+            self.kinova_robot.set_joint_angles(q_sol)
 
             self.state = STATE_STOP
             print(f"Entering STATE_STOP state")
@@ -169,7 +205,7 @@ class Main(BaseApp):
         q_diff_now = q_diff * proportion_now
         q_out = q_guess + q_diff_now
 
-        self.kinova_robot.set_joint_angles(q_sol, gripper_percentage=0)
+        self.kinova_robot.set_joint_angles(q_out, gripper_percentage=0)
 
         # return true if we were planning to get all the way to our target
         return proportion_now >= 1.0
@@ -193,6 +229,26 @@ class Main(BaseApp):
         pose.z = H_world[2]
 
         return pose
+    
+    def get_approach_pose(self,ee: EndEffector):
+        """
+        Takes a block pose and returns the pose the arm should go to for picking it up
+        """
+        ee_out = EndEffector()
+        
+        # The roll should be the same, so the gripper faces align with the block sides
+        ee_out.rotz = ee.rotz
+
+        # The z axis should be facing down (either a rotation by pi about y or x)
+        ee_out.rotx = np.pi
+        ee_out.roty = 0.0
+
+        # The X and Y positions should be the same as the block, and the Z a bit over it
+        ee_out.x = ee.x
+        ee_out.y = ee.y
+        ee_out.z = ee.z + APPROACH_Z_OFFSET
+
+        return ee_out
 
     def process_frame(self):
         poses = {}
@@ -204,7 +260,6 @@ class Main(BaseApp):
         corners, ids, rejected = self.detector.detectMarkers(frame)
 
         img_clone = frame.copy()
-        has_found_tag = False
 
         if len(corners) < 1:
             # we haven't found a marker, exit early
@@ -225,7 +280,6 @@ class Main(BaseApp):
             #print(f"tvecs: {tvecs}")
             poses[ids[i]] = [rvecs, tvecs]
 
-        ############ TODO include an offset for the height of the block so we're targeting the block center, not tag
         return poses
 
 
