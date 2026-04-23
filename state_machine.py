@@ -3,7 +3,7 @@ import time
 import cv2
 import numpy as np
 from kinova_lite_kinematics_dh import KinovaLiteDH
-from utils import EndEffector
+from utils import EndEffector, rotm_to_euler
 
 STATE_SEARCH = 0
 STATE_APPROCH_TARGET = 1
@@ -18,6 +18,13 @@ RS_INTRINSIC_COLOR_640 = np.array([
 ])
 
 RS_DIST_COLOR_640 = np.array([0,0,0,0,0])
+
+H_CAMERA_TO_ROBOT = np.array([
+    [1,0,0,0],
+    [0,1,0,0],
+    [0,0,1,0],
+    [0,0,0,1],
+])
 
 class Main(BaseApp):
     """
@@ -51,6 +58,7 @@ class Main(BaseApp):
         self.goal_id = 2 # id of the block that we stack targets on
         self.current_target_id = None
         self.last_known_target_pose = None
+        self.last_known_goal_pose = None
 
         self.camMatrix = RS_INTRINSIC_COLOR_640
         self.distCoeffs = RS_DIST_COLOR_640
@@ -71,13 +79,67 @@ class Main(BaseApp):
                     return
                 
         elif self.state == STATE_APPROCH_TARGET:
-            pass
+            poses = self.process_frame()
+            detected_ids = poses.keys()
+            if self.current_target_id not in detected_ids:
+                # we lost the target! can't see it anymore
+                # TODO maybe do something here? 
+                pass
+            
+            if self.current_target_id in detected_ids:
+                # update target pose
+                self.last_known_target_pose = poses[self.current_target_id]
+
+            # Map OpenCV output in the camera frame to position in the world frame
+            pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_target_pose[1],rvecs=self.last_known_target_pose[0])
+
+            # go towards the target pose
+            ## TODO we don't want to match the pose exactly --- instead be looking downwards, and target slightly above it
+            at_target = self.go_towards_pose(pose_robot_frame, 0.1)
+            if at_target:
+                # we reached our target (the block)
+                self.state = STATE_GRAB
+                print(f"Entering STATE_GRAB state")
+
         elif self.state == STATE_GRAB:
-            pass
+            # Close the gripper without moving our EE pose
+
+            ### TODO make the robot start a little higher than the block and then advance on it
+
+            self.kinova_robot.close_gripper()
+            self.state = STATE_APPROACH_GOAL
+            print(f"Entering STATE_APPROACH_GOAL state")
+            
         elif self.state == STATE_APPROACH_GOAL:
-            pass
+            # We've grabbed the target block, now we can go to the goal
+            poses = self.process_frame()
+            detected_ids = poses.keys()
+            if self.goal_id in detected_ids:
+                self.last_known_goal_pose = poses[self.goal_id]
+            
+            # Map OpenCV output in the camera frame to position in the world frame
+            pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_goal_pose[1],rvecs=self.last_known_goal_pose[0])
+
+            # go towards the target pose
+            ## TODO we don't want to match the pose exactly --- instead be looking downwards, and target slightly above it
+            at_goal = self.go_towards_pose(pose_robot_frame, 0.1)
+            if at_goal:
+                # we reached our target (the block)
+                self.state = STATE_RELEASE
+                print(f"Entering STATE_RELEASE state")
+
         elif self.state == STATE_RELEASE:
-            pass
+            # Open the gripper without moving our EE pose
+            self.kinova_robot.open_gripper()
+
+            # Our old goal is covered, our new goal (if stacking multiple blocks) is our earlier target
+            self.goal_id = self.current_target_id
+            self.target_ids.remove(self.current_target_id)
+
+            ### TODO make the robot retreat a bit, go to some neutral position 
+
+            self.state = STATE_STOP
+            print(f"Entering STATE_STOP state")
         else:
             pass
     
@@ -102,19 +164,35 @@ class Main(BaseApp):
 
         mag_max_change = np.max(np.abs(q_diff))
         proportion_now = max_rad / mag_max_change # proportion of the total trajectory to do at once
+        proportion_now = min(1.0, proportion_now)
+
         q_diff_now = q_diff * proportion_now
         q_out = q_guess + q_diff_now
 
         self.kinova_robot.set_joint_angles(q_sol, gripper_percentage=0)
 
+        # return true if we were planning to get all the way to our target
+        return proportion_now >= 1.0
         
-    
-    def get_target_pos(self,spoof=False):
+
+    def camera_to_world_frame(self,tvecs,rvecs):
         """
-        
+        Maps the output of opencv's solvePnP to the world frame
         """
-    
-    def 
+        R_cam, _ = cv2.Rodrigues(rvecs) # marker frame to camera frame
+        H_cam = np.eye(4)
+        H_cam[:3,:3] = R_cam
+        H_cam[:3,3] = tvecs
+
+        H_world = H_CAMERA_TO_ROBOT @ H_cam
+
+        pose = EndEffector()
+        pose.rotx, pose.roty, pose.rotz = rotm_to_euler(H_world[:3,:3])
+        pose.x = H_world[0]
+        pose.y = H_world[1]
+        pose.z = H_world[2]
+
+        return pose
 
     def process_frame(self):
         poses = {}
@@ -146,6 +224,8 @@ class Main(BaseApp):
             )
             #print(f"tvecs: {tvecs}")
             poses[ids[i]] = [rvecs, tvecs]
+
+        ############ TODO include an offset for the height of the block so we're targeting the block center, not tag
         return poses
 
 
