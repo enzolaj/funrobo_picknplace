@@ -20,12 +20,7 @@ class KinovaLiteDH(KinovaRobotTemplate):
             [-2.530, 2.530],
             [-2.600, 2.600],
         ]
-        self.d1 = 0.24325
-        self.a2 = 0.28
-        self.a3 = 0.14
-        self.d4 = 0.02
-        self.d5 = 0.105
-        self.d6 = 0.105
+
 
     def _compute_transforms(self, joint_values):
         """
@@ -40,14 +35,13 @@ class KinovaLiteDH(KinovaRobotTemplate):
         
         # DH parameters based on Standard DH Table (Table 1)
         # Format: [theta, d, a, alpha]
-        # Using class attributes for offsets d and lengths a
         DH = np.array([
-            [theta[0],           self.d1,            0.0,      pi/2],
-            [theta[1] + pi/2,    30.0/1000.0,        0.28,     pi],
-            [theta[2] + pi/2,    20.0/1000.0,        0.0,      pi/2],
-            [theta[3] + pi/2,    (140.0+105.0)/1000, 0.0,      pi/2],
-            [theta[4] + pi,      (28.5+28.5)/1000,   0.0,      pi/2],
-            [theta[5] + pi/2,    (105.0+130.0)/1000, 0.0,      0.0]
+            [theta[0] - pi/2, 0.24325,           0.0,  pi/2], # Joint 1
+            [theta[1] + pi/2, 0.032077,          0.28, pi  ], # Joint 2
+            [theta[2] + pi/2, 0.022077,          0.0,  pi/2], # Joint 3
+            [theta[3] + pi/2, 0.245,             0.0,  pi/2], # Joint 4 
+            [theta[4] + pi,   0.057,             0.0,  pi/2], # Joint 5 
+            [theta[5] + pi/2, 0.235,             0.0,  0.0 ]  # Joint 6 
         ])
 
         Hlist = [ut.dh_to_matrix(dh) for dh in DH] # Compute transformation matrices for each joint
@@ -87,41 +81,41 @@ class KinovaLiteDH(KinovaRobotTemplate):
             J[3:, i] = z_axis
         return J
 
-    def calc_inverse_kinematics(self, target_ee, q_guess=None, tol=1e-4, ilimit=200):
-        if q_guess is None:
-            q_guess = np.array([1.75, 5.76, 2.18, 2.44, 4.54, 0.0])
-
-        q = np.array(q_guess, dtype=float)
-        lambda_sq = 0.01
+    def calc_inverse_kinematics(self, target_ee, q_guess=None, tol=1e-4, ilimit=150):
+        q = np.array(q_guess if q_guess is not None else [0.0]*6, dtype=float)
+        lambda_sq = 0.01  # Damping factor for singularity robustness
+        
+        # Target pose extraction
+        p_targ = np.array([target_ee.x, target_ee.y, target_ee.z])
+        R_targ = ut.euler_to_rotm((target_ee.rotx, target_ee.roty, target_ee.rotz))
 
         for _ in range(ilimit):
-            curr_ee, _ = self.calc_forward_kinematics(q.tolist(), radians=True)
-
-            dp = np.array(
-                [
-                    target_ee.x - curr_ee.x,
-                    target_ee.y - curr_ee.y,
-                    target_ee.z - curr_ee.z,
-                ]
-            )
-            R_curr = ut.euler_to_rotm((curr_ee.rotx, curr_ee.roty, curr_ee.rotz))
-            R_targ = ut.euler_to_rotm((target_ee.rotx, target_ee.roty, target_ee.rotz))
+            H_c, _ = self._compute_transforms(q)
+            H_ee = H_c[-1]
+            
+            # Position Error
+            dp = p_targ - H_ee[:3, 3]
+            
+            # Orientation Error (Skew symmetric matrix)
+            R_curr = H_ee[:3, :3]
             R_err = R_targ @ R_curr.T
-            do = 0.5 * np.array(
-                [
-                    R_err[2, 1] - R_err[1, 2],
-                    R_err[0, 2] - R_err[2, 0],
-                    R_err[1, 0] - R_err[0, 1],
-                ]
-            )
+            do = 0.5 * np.array([
+                R_err[2, 1] - R_err[1, 2],
+                R_err[0, 2] - R_err[2, 0],
+                R_err[1, 0] - R_err[0, 1]
+            ])
+            
+            # Combine position and orientation erros
             error = np.hstack([dp, do])
             if np.linalg.norm(error) < tol:
-                return [ut.wraptopi(float(val)) for val in q]
+                return [ut.wraptopi(val) for val in q]
 
-            J = self.jacobian(q.tolist())
-            dq = J.T @ np.linalg.inv(J @ J.T + lambda_sq * np.eye(6)) @ error
-            q = q + dq
-            for i in range(6):
-                q[i] = np.clip(q[i], self.joint_limits[i][0], self.joint_limits[i][1])
+            # Damped Least Squares Update
+            J = self.jacobian(q)
+            JJT = J @ J.T + lambda_sq * np.eye(6)
+            dq = J.T @ np.linalg.solve(JJT, error)
+            q += dq
+            limits = np.array(self.joint_limits)
+            q = np.clip(q, limits[:, 0], limits[:, 1])
 
         return q
