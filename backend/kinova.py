@@ -330,9 +330,18 @@ class SimKinova:
             # Calculate the shortest path
             raw_diff = target_angles - start_angles
             shortest_diff = (raw_diff + np.pi) % (2 * np.pi) - np.pi
-
-            # THE FIX: Calculate the exact un-wrapped number PyBullet should rest at
             continuous_target = start_angles + shortest_diff
+
+            # If the circular shortcut would push a joint past its URDF limit,
+            # fall back to the direct path for that joint. Both start and
+            # target are already within limits, so the direct path is safe.
+            arm_idx = self.arm_joints[: len(target_angles)]
+            lo = np.array([self.p.getJointInfo(self.robot_id, j)[8] for j in arm_idx])
+            hi = np.array([self.p.getJointInfo(self.robot_id, j)[9] for j in arm_idx])
+            violates = (continuous_target > hi) | (continuous_target < lo)
+            if np.any(violates):
+                continuous_target = np.where(violates, target_angles, continuous_target)
+                shortest_diff = continuous_target - start_angles
 
             # Find the joint that has to travel the furthest
             max_distance = np.max(np.abs(shortest_diff))
