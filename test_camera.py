@@ -9,8 +9,8 @@ detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 # Positions of tags in robot frame, X distance, Y distance in meters
 TAG_POSITIONS_IN_ROBOT_FRAME = {
     4: np.array([0.405, 0.0], dtype=np.float32),
-    6: np.array([0.405, -0.41], dtype=np.float32),
-    7: np.array([0.0,  -0.41], dtype=np.float32)
+    6: np.array([0.405, -0.42], dtype=np.float32),
+    7: np.array([0.0,  -0.42], dtype=np.float32)
 }
 
 # bounds for colors for mask for each cube
