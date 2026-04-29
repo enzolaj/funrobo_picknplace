@@ -4,6 +4,9 @@ import cv2
 import numpy as np
 from kinova_lite_kinematics_dh import KinovaLiteDH
 from utils import EndEffector, rotm_to_euler
+import sys
+import faulthandler
+faulthandler.enable()
 
 STATE_SEARCH = 0
 STATE_APPROCH_TARGET = 1
@@ -23,9 +26,9 @@ RS_DIST_COLOR_640 = np.array([0,0,0,0,0])
 
 # Transformations for our scene
 H_CAMERA_TO_ROBOT = np.array([
-    [1,0,0,0],
-    [0,1,0,0],
-    [0,0,1,0],
+    [0,-1,0,0.33],
+    [1,0,0,0.20],
+    [0,0,-1,2.8],
     [0,0,0,1],
 ])
 
@@ -37,17 +40,65 @@ H_TAG_TO_BLOCK_CENTER = np.array([
     [0,0,0,1],
 ])
 
+TABLE_PTS = np.array([
+    [0.406, -0.03, 0.0],   # tag ID 4
+    [0.406, 0.438, 0.0],   # tag ID 6
+    [-0.02, 0.438, 0.0],   # tag ID 7
+], dtype=np.float32)
+
+TAG_IDS = [4,6,7]
+
+HOME_JOINTS = np.array([1.75, 5.76, 2.18, 2.44, 4.54, 0.0])
+
+def rigid_transform_3d(A, B):
+    """
+    A: Nx3 points in table frame
+    B: Nx3 points in camera frame
+
+    Returns:
+        A matrix mapping table frame to camrea frame
+    """
+    centroid_A = A.mean(axis=0)
+    centroid_B = B.mean(axis=0)
+
+    AA = A - centroid_A
+    BB = B - centroid_B
+
+    H = AA.T @ BB
+    U, S, Vt = np.linalg.svd(H)
+
+    R = Vt.T @ U.T
+
+    # Fix reflection if needed
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    
+    # Z axis should be negative (flipped camera from world Z)
+    #if R[2, 2] > 0:
+    #    R[:, 2] *= -1   # flip Z axis
+    #    R[:, 1] *= -1 
+
+    t = centroid_B - R @ centroid_A
+    H_out = np.eye(4)
+    H_out[:3,:3] = R
+    H_out[:3,3] = t
+
+    return H_out
+
 class Main(BaseApp):
     """
     
     """
+    def __init__(self,simulate=True, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=0):
+        self.cap = cv2.VideoCapture(video_device)
+        super().__init__(simulate=True, urdf_path="visualizer/6dof/urdf/6dof.urdf")
 
     def start(self):
         """
         
         """
         self.state = STATE_SEARCH
-        self.cap = cv2.VideoCapture(0)
 
         self.model = KinovaLiteDH()
 
@@ -57,19 +108,22 @@ class Main(BaseApp):
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict,detectorParams=self.detect_params)
 
         self.use_gui = True
-        marker_length = 25.4 # 100 mm
+        self.marker_length = 0.0254 # 100 mm
         self.obj_pt_arr = np.asarray([
-            [-marker_length/2.0,marker_length/2.0,0],
-            [marker_length/2.0,marker_length/2.0,0],
-            [marker_length/2.0,-marker_length/2.0,0],
-            [-marker_length/2.0,-marker_length/2.0,0]
+            [-self.marker_length/2.0,self.marker_length/2.0,0],
+            [self.marker_length/2.0,self.marker_length/2.0,0],
+            [self.marker_length/2.0,-self.marker_length/2.0,0],
+            [-self.marker_length/2.0,-self.marker_length/2.0,0]
         ])
 
-        self.target_ids = [1] # ids of the blocks to move
-        self.goal_id = 2 # id of the block that we stack targets on
+        self.target_ids = [1,2] # ids of the blocks to move
+        self.goal_id = 3 # id of the block that we stack targets on
         self.current_target_id = None
         self.last_known_target_pose = None
         self.last_known_goal_pose = None
+
+        self.table_marker_poses = [None, None, None]
+        self.table_to_cam = np.eye(4)
 
         self.grab_ee_target = None # EE object that defines where to move the gripper to pick up or release
 
@@ -77,10 +131,27 @@ class Main(BaseApp):
         self.distCoeffs = RS_DIST_COLOR_640
     
     def loop(self):
+        #print(f"self.tablemarkerposes = {self.table_marker_poses}")
+        if not any(val is None for val in self.table_marker_poses):
+            camera_pts = np.vstack([tvec.reshape(1, 3) for tvec in self.table_marker_poses])
+            print(f"camera pts: {camera_pts}, {camera_pts.shape}")
+            self.table_to_cam = rigid_transform_3d(TABLE_PTS,camera_pts)
+            print(self.table_to_cam)
+            H_cam_to_table = np.linalg.inv(self.table_to_cam)
+            for marker in self.table_marker_poses:
+                p_cam = np.append(marker, 1.0)
+                p_table_est = H_cam_to_table @ p_cam
+                print(p_table_est[:3])
+            print("----------------------------------")
+
         if self.state == STATE_SEARCH:
             # Look for the target block position 
             # Approach it once we find it 
-            poses = self.process_frame()
+            ret,poses = self.process_frame()
+            if not ret:
+                # failed to identify poses
+                return
+            print(f"poses: {poses}")
             detected_ids = poses.keys()
             for detected in detected_ids:
                 if detected in self.target_ids:
@@ -92,7 +163,7 @@ class Main(BaseApp):
                     return
                 
         elif self.state == STATE_APPROCH_TARGET:
-            poses = self.process_frame()
+            ret,poses = self.process_frame()
             detected_ids = poses.keys()
             if self.current_target_id not in detected_ids:
                 # we lost the target! can't see it anymore
@@ -108,7 +179,7 @@ class Main(BaseApp):
             target_pose = self.get_approach_pose(pose_robot_frame)
 
             # go towards the target pose
-            at_target = self.go_towards_pose(target_pose, 0.1)
+            at_target = self.go_towards_pose(target_pose, 0.01)
             if at_target:
                 # we reached our target (the block)
                 self.state = STATE_GRAB
@@ -133,7 +204,7 @@ class Main(BaseApp):
             
         elif self.state == STATE_APPROACH_GOAL:
             # We've grabbed the target block, now we can go to the goal
-            poses = self.process_frame()
+            ret,poses = self.process_frame()
             detected_ids = poses.keys()
             if self.goal_id in detected_ids:
                 self.last_known_goal_pose = poses[self.goal_id]
@@ -183,12 +254,14 @@ class Main(BaseApp):
         """
         Move a small amount towards a given pose in joint space
         """
-        target_pos = pose[0]
-        target_rpy = pose[1]
+        return 0
+        #target_pos = pose[0]
+        #target_rpy = pose[1]
 
-        target = EndEffector() # Make end effector object
-        target.x, target.y, target.z = target_pos
-        target.rotx, target.roty, target.rotz = target_rpy
+        #target = EndEffector() # Make end effector object
+        #target.x, target.y, target.z = target_pos
+        #target.rotx, target.roty, target.rotz = target_rpy
+        target = pose
 
         q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
         q_sol = self.model.calc_inverse_kinematics(target, q_guess=q_guess)
@@ -205,7 +278,9 @@ class Main(BaseApp):
         q_diff_now = q_diff * proportion_now
         q_out = q_guess + q_diff_now
 
+        print(f"setting joint angles {q_out}")
         self.kinova_robot.set_joint_angles(q_out, gripper_percentage=0)
+        print(f"got to pose")
 
         # return true if we were planning to get all the way to our target
         return proportion_now >= 1.0
@@ -223,10 +298,14 @@ class Main(BaseApp):
         H_world = H_CAMERA_TO_ROBOT @ H_cam
 
         pose = EndEffector()
-        pose.rotx, pose.roty, pose.rotz = rotm_to_euler(H_world[:3,:3])
-        pose.x = H_world[0]
-        pose.y = H_world[1]
-        pose.z = H_world[2]
+        #pose.rotx, pose.roty, pose.rotz = rotm_to_euler(H_world[:3,:3])
+        rot_xyz = rotm_to_euler(H_world[:3,:3])
+        pose.rotx = rot_xyz[0]
+        pose.roty = rot_xyz[1]
+        pose.rotz = rot_xyz[2]
+        pose.x = H_world[0,3]
+        pose.y = H_world[1,3]
+        pose.z = H_world[2,3]
 
         return pose
     
@@ -255,10 +334,9 @@ class Main(BaseApp):
         ret, frame = self.cap.read()
         if not ret:
             print("Could not read frame")
-            return
-
+            return False,poses
         corners, ids, rejected = self.detector.detectMarkers(frame)
-
+        print(ids)
         img_clone = frame.copy()
 
         if len(corners) < 1:
@@ -267,9 +345,10 @@ class Main(BaseApp):
                 cv2.imshow("Camera Feed",img_clone)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     del(self)
-            return
+                
+            return False,poses
 
-        n_markers = len(corners[0])
+        n_markers = len(corners)
         for i in range(n_markers):
             _, rvecs, tvecs = cv2.solvePnP(
                 objectPoints=self.obj_pt_arr,
@@ -278,13 +357,55 @@ class Main(BaseApp):
                 distCoeffs=self.distCoeffs,
             )
             #print(f"tvecs: {tvecs}")
-            poses[ids[i]] = [rvecs, tvecs]
+            if self.use_gui:
+                cv2.aruco.drawDetectedMarkers(img_clone, corners, ids)
+                cv2.drawFrameAxes(
+                    img_clone,
+                    self.camMatrix,
+                    self.distCoeffs,
+                    rvecs,
+                    tvecs,
+                    self.marker_length * 0.5,  # axis length
+                )
 
-        return poses
+                cv2.imshow("Camera Feed",img_clone)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    del(self)
+                
+                # convert poses from mm to m
+                poses[ids[i][0]] = [rvecs.squeeze(), tvecs.squeeze()]
+                print(poses)
+            
+            for j in range(len(TABLE_PTS)):
+                if ids[i].squeeze() == TAG_IDS[j]:
+                    self.table_marker_poses[j] = tvecs.squeeze()
+
+        return True,poses
 
 
 if __name__ == "__main__":
-    final_project = Main(simulate=True, urdf_path="visualizer/6dof/urdf/6dof.urdf")
+    # video_num = 0
+    # print(sys.argv)
+    # if len(sys.argv) > 1:
+    #     video_num = sys.argv[1]
+    #     print(video_num)
+    # cap = cv2.VideoCapture(video_num)
+    # while True:
+    #     if not cap.isOpened():
+    #         continue
+    #     ret,frame = cap.read()
+    #     print("tried reading")
+    #     if not ret:
+    #         continue
+    #     cv2.imshow("frame",frame)
+    #     if cv2.waitKey(1) & 0xFF == ord('q'):
+    #         pass
+    video_num = 0
+    print(sys.argv)
+    if len(sys.argv) > 1:
+        video_num = int(sys.argv[1])
+    final_project = Main(simulate=True, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=video_num)
+
 
     try:
         while True:
