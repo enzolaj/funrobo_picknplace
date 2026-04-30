@@ -13,6 +13,12 @@ TAG_POSITIONS_IN_ROBOT_FRAME = {
     7: np.array([0.0,  -0.42], dtype=np.float32)
 }
 
+TAG_POSITIONS_IN_ROBOT_FRAME = {
+    9: np.array([0.262, -0.057], dtype=np.float32),
+    5: np.array([-.21, -0.057], dtype=np.float32),
+    8: np.array([-.21,  -.415], dtype=np.float32)
+}
+
 # bounds for colors for mask for each cube
 # these arent 100% perfect so maybe something to tweak later
 red_lower = np.array([0, 100, 100])
@@ -52,7 +58,7 @@ def get_robot_coords(mask, affine_matrix):
 
 
 if __name__ == "__main__":
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(8)
 
     while True:
         ret, frame = cap.read()
@@ -75,7 +81,7 @@ if __name__ == "__main__":
                     robot_pts.append(TAG_POSITIONS_IN_ROBOT_FRAME[tag_id])
 
             if len(pixel_pts) >= 3:
-                affine_matrix = cv2.getAffineTransform(
+                affine_matrix = cv2.getAffineTransform( # 2 x 3 (pixels to xy)
                     np.float32(pixel_pts[:3]),
                     np.float32(robot_pts[:3])
                 )
