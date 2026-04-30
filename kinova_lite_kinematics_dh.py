@@ -82,12 +82,27 @@ class KinovaLiteDH(KinovaRobotTemplate):
         return J
 
     def calc_inverse_kinematics(self, target_ee, q_guess=None, tol=1e-4, ilimit=150):
-        q = np.array(q_guess if q_guess is not None else [0.0]*6, dtype=float)
-        lambda_sq = 0.01  # Damping factor for singularity robustness
+        q = np.array(q_guess if q_guess is not None else [0.0] * 6, dtype=float)
+        q = np.array([ut.wraptopi(val) for val in q], dtype=float)
+
+        # Damping factor for singularity robustness (adaptive below)
+        lambda_sq = 1e-3
+
+        # Weight orientation less than position to reduce "branch flipping"
+        # when you mostly care about xyz reaching the block.
+        w_pos = 1.0
+        w_ori = 0.15
+        W = np.diag([w_pos, w_pos, w_pos, w_ori, w_ori, w_ori])
+
+        # Limit per-iteration joint update to keep the solver smooth/stable.
+        max_step = 0.25  # rad
         
         # Target pose extraction
         p_targ = np.array([target_ee.x, target_ee.y, target_ee.z])
         R_targ = ut.euler_to_rotm((target_ee.rotx, target_ee.roty, target_ee.rotz))
+
+        best_q = q.copy()
+        best_err = float("inf")
 
         for _ in range(ilimit):
             H_c, _ = self._compute_transforms(q)
@@ -107,15 +122,52 @@ class KinovaLiteDH(KinovaRobotTemplate):
             
             # Combine position and orientation erros
             error = np.hstack([dp, do])
-            if np.linalg.norm(error) < tol:
+            weighted_error = W @ error
+
+            err_norm = float(np.linalg.norm(weighted_error))
+            if err_norm < best_err:
+                best_err = err_norm
+                best_q = q.copy()
+
+            if err_norm < tol:
                 return [ut.wraptopi(val) for val in q]
 
             # Damped Least Squares Update
             J = self.jacobian(q)
-            JJT = J @ J.T + lambda_sq * np.eye(6)
-            dq = J.T @ np.linalg.solve(JJT, error)
-            q += dq
+            J_w = W @ J
+            JJT = J_w @ J_w.T + lambda_sq * np.eye(6)
+            dq = J_w.T @ np.linalg.solve(JJT, weighted_error)
+
+            # Step limiting
+            max_abs = float(np.max(np.abs(dq)))
+            if max_abs > max_step:
+                dq *= (max_step / (1e-9 + max_abs))
+
+            q_next = q + dq
+
+            # Adaptive damping: if we made things worse, damp harder and take smaller steps
+            H_c_next, _ = self._compute_transforms(q_next)
+            dp_next = p_targ - H_c_next[-1][:3, 3]
+            R_curr_next = H_c_next[-1][:3, :3]
+            R_err_next = R_targ @ R_curr_next.T
+            do_next = 0.5 * np.array(
+                [
+                    R_err_next[2, 1] - R_err_next[1, 2],
+                    R_err_next[0, 2] - R_err_next[2, 0],
+                    R_err_next[1, 0] - R_err_next[0, 1],
+                ]
+            )
+            err_next = np.hstack([dp_next, do_next])
+            err_next_norm = float(np.linalg.norm(W @ err_next))
+            if err_next_norm > err_norm * 1.05:
+                lambda_sq = min(1.0, lambda_sq * 10.0)
+                q_next = q + 0.5 * dq
+            else:
+                lambda_sq = max(1e-6, lambda_sq * 0.9)
+
+            q = q_next
             limits = np.array(self.joint_limits)
+            q = np.array([ut.wraptopi(val) for val in q], dtype=float)
             q = np.clip(q, limits[:, 0], limits[:, 1])
 
-        return q
+        return [ut.wraptopi(val) for val in best_q]

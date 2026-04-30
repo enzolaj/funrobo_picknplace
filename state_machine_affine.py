@@ -26,6 +26,11 @@ green_upper = np.array([89, 255, 255])
 
 APPROACH_Z_OFFSET = 0.07
 
+# Camera needs a moment to settle exposure/white-balance on startup.
+# During warmup we still show the frame, but ignore detections.
+CAMERA_WARMUP_SECONDS = 1.5
+CAMERA_WARMUP_DISCARD_FRAMES = 30
+
 # Parameters for Realsense Color channel, 
 RS_INTRINSIC_COLOR_640 = np.array([
     [615.21,0,310.90],[0,614.45,243.97],[0,0,1]
@@ -49,12 +54,6 @@ H_TAG_TO_BLOCK_CENTER = np.array([
     [0,0,0,1],
 ])
 
-TABLE_PTS = np.array([
-    [0.406, -0.03, 0.0],   # tag ID 4
-    [0.406, 0.438, 0.0],   # tag ID 6
-    [-0.02, 0.438, 0.0],   # tag ID 7
-], dtype=np.float32)
-
 HOME_POSITION = np.array([1.25, 5.76, 2.18, 2.44, 4.54, 0.0])
 
 TAG_IDS = [4,6,7]
@@ -68,6 +67,23 @@ TAG_POSITIONS_IN_ROBOT_FRAME = {
     6: np.array([0.405, -0.42], dtype=np.float32),
     7: np.array([0.0,  -0.42], dtype=np.float32)
 }
+
+
+def _wrap_to_pi(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=float)
+    return (q + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _shortest_angle_diff(q_to: np.ndarray, q_from: np.ndarray) -> np.ndarray:
+    return _wrap_to_pi(np.asarray(q_to, dtype=float) - np.asarray(q_from, dtype=float))
+
+
+def _clip_to_limits(q: np.ndarray, joint_limits) -> np.ndarray:
+    q = np.asarray(q, dtype=float)
+    limits = np.asarray(joint_limits, dtype=float)
+    if limits.shape != (6, 2):
+        return q
+    return np.clip(q, limits[:, 0], limits[:, 1])
 
 #TAG_POSITIONS_IN_ROBOT_FRAME = {
 ##    9: np.array([0.262, -0.057], dtype=np.float32),
@@ -117,6 +133,8 @@ class Main(BaseApp):
         self.state = STATE_SEARCH
 
         self.model = KinovaLiteDH()
+        self._camera_start_time = time.time()
+        self._camera_discard_remaining = CAMERA_WARMUP_DISCARD_FRAMES
 
         # Used for detecting aruco markers
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
@@ -149,6 +167,8 @@ class Main(BaseApp):
         self.camMatrix = RS_INTRINSIC_COLOR_640
         self.distCoeffs = RS_DIST_COLOR_640
         self.kinova_robot.set_joint_angles(HOME_POSITION, gripper_percentage=0)
+
+        self.count_stacked = 0
     
     def loop(self):
         if self.state == STATE_SEARCH:
@@ -186,7 +206,7 @@ class Main(BaseApp):
             # pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_target_pose[1],rvecs=self.last_known_target_pose[0])
             target_pose = EndEffector()
             target_pose.rotx = target_pose.roty = target_pose.rotz = 0
-            target_pose.z = 0.01
+            target_pose.z = -0.01
             target_pose.x = self.last_known_target_pose[0]
             target_pose.y = self.last_known_target_pose[1]
 
@@ -236,7 +256,7 @@ class Main(BaseApp):
             #pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_goal_pose[1],rvecs=self.last_known_goal_pose[0])
             goal_pose = EndEffector()
             goal_pose.rotx = goal_pose.roty = goal_pose.rotz = 0
-            goal_pose.z = 0.01
+            goal_pose.z = 0.025 + self.count_stacked * 0.025
             goal_pose.x = self.last_known_goal_pose[0]
             goal_pose.y = self.last_known_goal_pose[1]
             goal_pose = self.get_approach_pose(goal_pose)
@@ -274,9 +294,13 @@ class Main(BaseApp):
             q_sol = self.model.calc_inverse_kinematics(shifted_goal, q_guess=q_guess)
             q_sol = np.asarray(q_sol, dtype=float)
             self.kinova_robot.set_joint_angles(q_sol)
+            self.kinova_robot.set_joint_angles(HOME_POSITION, gripper_percentage=0)
 
-            self.state = STATE_STOP
-            print(f"Entering STATE_STOP state")
+            # self.state = STATE_STOP
+            # print(f"Entering STATE_STOP state")
+            self.count_stacked += 1
+            self.state = STATE_SEARCH
+            print(f"Entering STATE_SEARCH state")
         else:
             pass
     
@@ -295,20 +319,23 @@ class Main(BaseApp):
         while not success:
             target = pose
 
-            q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
-            q_sol = self.model.calc_inverse_kinematics(target, q_guess=q_guess)
-            q_sol = np.asarray(q_sol, dtype=float)
+            # Hardware returns angles that may be in [0, 2pi). Normalize to [-pi, pi]
+            # so IK and shortest-path stepping stay continuous.
+            q_meas = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
+            q_guess = _wrap_to_pi(q_meas)
 
-            q_diff = q_sol - q_guess
-            q_diff = np.mod(q_diff, 2*np.pi)
-            q_diff = np.where(q_diff > np.pi, q_diff - 2*np.pi, q_diff)
+            q_sol = self.model.calc_inverse_kinematics(target, q_guess=q_guess)
+            q_sol = _wrap_to_pi(np.asarray(q_sol, dtype=float))
+
+            q_diff = _shortest_angle_diff(q_sol, q_guess)
 
             mag_max_change = np.max(np.abs(q_diff))
             proportion_now = max_rad / (1e-5 + mag_max_change) # proportion of the total trajectory to do at once
             proportion_now = min(1.0, proportion_now)
 
             q_diff_now = q_diff * proportion_now
-            q_out = q_guess + q_diff_now
+            q_out = _wrap_to_pi(q_guess + q_diff_now)
+            q_out = _clip_to_limits(q_out, getattr(self.model, "joint_limits", None))
 
             ee_out,_ = self.model.calc_forward_kinematics(q_out.tolist())
             print(f"EE out, predicted: {ee_out.x}, {ee_out.y}, {ee_out.z}")
@@ -317,14 +344,22 @@ class Main(BaseApp):
 
                 print(f"setting joint angles {q_out}, with prop {proportion_now}")
                 print(f"my joints are {self.kinova_robot.get_joint_angles()}")
-                self.kinova_robot.set_joint_angles(q_out,wait=True)
+                self.kinova_robot.set_joint_angles(q_out, wait=True)
                 print(f"got to pose")
             
             else:
                 print(f"Tried to move into the table, will try again")
 
-        # return true if we were planning to get all the way to our target
-        return proportion_now >= 1.0
+        # Only treat as "at target" if the *measured* robot state is close.
+        # The physical backend unblocks on ACTION_ABORT as well as ACTION_END,
+        # so we must verify rather than assuming success.
+        q_after = _wrap_to_pi(np.array(self.kinova_robot.get_joint_angles(), dtype=float))
+        q_err = np.max(np.abs(_shortest_angle_diff(q_out, q_after)))
+        ee_after, _ = self.model.calc_forward_kinematics(q_after.tolist())
+        pos_err = float(np.linalg.norm(np.array([ee_after.x - pose.x, ee_after.y - pose.y, ee_after.z - pose.z])))
+
+        reached = (q_err < 0.10) and (pos_err < 0.02)
+        return bool(reached and proportion_now >= 1.0)
         
 
     def camera_to_world_frame(self,tvecs,rvecs):
@@ -378,6 +413,11 @@ class Main(BaseApp):
             return False,poses
         img_clone = frame.copy()
 
+        # Warm up camera auto settings; ignore detections briefly.
+        if self._camera_discard_remaining > 0:
+            self._camera_discard_remaining -= 1
+        warming_up = (time.time() - self._camera_start_time) < CAMERA_WARMUP_SECONDS
+
         # Calling the detect markers
         corners, ids, rejected = self.detector.detectMarkers(frame)
         
@@ -417,7 +457,7 @@ class Main(BaseApp):
         green_mask = cv2.erode(green_mask, None, iterations=2)
         green_mask = cv2.dilate(green_mask, None, iterations=2)
 
-        if affine_matrix is not None:
+        if affine_matrix is not None and (not warming_up) and self._camera_discard_remaining <= 0:
             masks = {
                 "Red": red_mask,
                 "Blue": blue_mask,
