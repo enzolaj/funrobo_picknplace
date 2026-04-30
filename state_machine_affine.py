@@ -24,7 +24,7 @@ blue_upper = np.array([115, 255, 255])
 green_lower = np.array([50, 80, 100]) 
 green_upper = np.array([89, 255, 255])
 
-APPROACH_Z_OFFSET = 0.05
+APPROACH_Z_OFFSET = 0.07
 
 # Parameters for Realsense Color channel, 
 RS_INTRINSIC_COLOR_640 = np.array([
@@ -55,11 +55,12 @@ TABLE_PTS = np.array([
     [-0.02, 0.438, 0.0],   # tag ID 7
 ], dtype=np.float32)
 
+HOME_POSITION = np.array([1.25, 5.76, 2.18, 2.44, 4.54, 0.0])
+
 TAG_IDS = [4,6,7]
 
-TAG_IDS = [9,5,8]
+#TAG_IDS = [9,5,8]
 
-HOME_JOINTS = np.array([1.75, 5.76, 2.18, 2.44, 4.54, 0.0])
 TAG_POSITION_IN_ROBOT_FRAME = {}
 
 TAG_POSITIONS_IN_ROBOT_FRAME = {
@@ -68,11 +69,11 @@ TAG_POSITIONS_IN_ROBOT_FRAME = {
     7: np.array([0.0,  -0.42], dtype=np.float32)
 }
 
-TAG_POSITIONS_IN_ROBOT_FRAME = {
-    9: np.array([0.262, -0.057], dtype=np.float32),
-    5: np.array([-.21, -0.057], dtype=np.float32),
-    8: np.array([-.21,  -.415], dtype=np.float32)
-}
+#TAG_POSITIONS_IN_ROBOT_FRAME = {
+##    9: np.array([0.262, -0.057], dtype=np.float32),
+#   5: np.array([-.21, -0.057], dtype=np.float32),
+#    8: np.array([-.21,  -.415], dtype=np.float32)
+#}
 
 def get_robot_coords(mask, affine_matrix):
     # Find shapes in the mask
@@ -105,7 +106,7 @@ class Main(BaseApp):
     """
     
     """
-    def __init__(self,simulate=True, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=0):
+    def __init__(self,simulate=False, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=0):
         self.cap = cv2.VideoCapture(video_device)
         super().__init__(simulate=simulate, urdf_path=urdf_path)
 
@@ -147,6 +148,7 @@ class Main(BaseApp):
 
         self.camMatrix = RS_INTRINSIC_COLOR_640
         self.distCoeffs = RS_DIST_COLOR_640
+        self.kinova_robot.set_joint_angles(HOME_POSITION, gripper_percentage=0)
     
     def loop(self):
         if self.state == STATE_SEARCH:
@@ -156,7 +158,8 @@ class Main(BaseApp):
             if not ret:
                 # failed to identify poses
                 return
-            print(f"poses: {poses}")
+            #print(f"poses: {poses}")
+            print(poses.keys())
             detected_colors = poses.keys()
             for detected in detected_colors:
                 if detected in self.target_colors:
@@ -183,16 +186,16 @@ class Main(BaseApp):
             # pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_target_pose[1],rvecs=self.last_known_target_pose[0])
             target_pose = EndEffector()
             target_pose.rotx = target_pose.roty = target_pose.rotz = 0
-            target_pose.z = 0.15
+            target_pose.z = 0.01
             target_pose.x = self.last_known_target_pose[0]
             target_pose.y = self.last_known_target_pose[1]
 
             target_pose = self.get_approach_pose(target_pose)
             print(f"Trying to go to {self.current_target_color} at {target_pose.x: .4f}, {target_pose.y: .4f}, {target_pose.z: .4f}")
-            return # comment out to make it run
+            #return # comment out to make it run
 
             # go towards the target pose
-            at_target = self.go_towards_pose(target_pose, 0.01)
+            at_target = self.go_towards_pose(target_pose, 10.0)
             if at_target:
                 # we reached our target (the block)
                 self.state = STATE_GRAB
@@ -212,31 +215,37 @@ class Main(BaseApp):
             self.kinova_robot.set_joint_angles(q_sol)
 
             self.kinova_robot.close_gripper()
+
+            self.grab_ee_target = copy.copy(self.grab_ee_target)
+            self.grab_ee_target.z += APPROACH_Z_OFFSET
             self.state = STATE_APPROACH_GOAL
             print(f"Entering STATE_APPROACH_GOAL state")
             
         elif self.state == STATE_APPROACH_GOAL:
-            if self.last_known_goal_pose is None:
-                print(f"We haven't found the goal!")
-                return
             # We've grabbed the target block, now we can go to the goal
             ret,poses = self.process_frame()
             detected_colors = poses.keys()
             if self.goal_color in detected_colors:
                 self.last_known_goal_pose = poses[self.goal_color]
             
+            if self.last_known_goal_pose is None:
+                print(f"We haven't found the goal!")
+                return
+            
             # Map OpenCV output in the camera frame to position in the world frame
             #pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_goal_pose[1],rvecs=self.last_known_goal_pose[0])
             goal_pose = EndEffector()
             goal_pose.rotx = goal_pose.roty = goal_pose.rotz = 0
-            goal_pose.z = 0.15
+            goal_pose.z = 0.01
             goal_pose.x = self.last_known_goal_pose[0]
             goal_pose.y = self.last_known_goal_pose[1]
             goal_pose = self.get_approach_pose(goal_pose)
+            self.kinova_robot.close_gripper()
 
             # go towards the target pose
             ## TODO we don't want to match the pose exactly --- instead be looking downwards, and target slightly above it
-            at_goal = self.go_towards_pose(goal_pose, 0.1)
+            at_goal = self.go_towards_pose(goal_pose, 10.0)
+            
             if at_goal:
                 # we reached our target (the block)
                 target_pose_shifted = goal_pose
@@ -275,33 +284,44 @@ class Main(BaseApp):
         """
         Move a small amount towards a given pose in joint space
         """
-        return 0
+        #return 0
         #target_pos = pose[0]
         #target_rpy = pose[1]
 
         #target = EndEffector() # Make end effector object
         #target.x, target.y, target.z = target_pos
         #target.rotx, target.roty, target.rotz = target_rpy
-        target = pose
+        success = False
+        while not success:
+            target = pose
 
-        q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
-        q_sol = self.model.calc_inverse_kinematics(target, q_guess=q_guess)
-        q_sol = np.asarray(q_sol, dtype=float)
+            q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
+            q_sol = self.model.calc_inverse_kinematics(target, q_guess=q_guess)
+            q_sol = np.asarray(q_sol, dtype=float)
 
-        q_diff = q_sol - q_guess
-        q_diff = np.mod(q_diff, 2*np.pi)
-        q_diff = np.where(q_diff > np.pi, q_diff - 2*np.pi, q_diff)
+            q_diff = q_sol - q_guess
+            q_diff = np.mod(q_diff, 2*np.pi)
+            q_diff = np.where(q_diff > np.pi, q_diff - 2*np.pi, q_diff)
 
-        mag_max_change = np.max(np.abs(q_diff))
-        proportion_now = max_rad / (1e-5 + mag_max_change) # proportion of the total trajectory to do at once
-        proportion_now = min(1.0, proportion_now)
+            mag_max_change = np.max(np.abs(q_diff))
+            proportion_now = max_rad / (1e-5 + mag_max_change) # proportion of the total trajectory to do at once
+            proportion_now = min(1.0, proportion_now)
 
-        q_diff_now = q_diff * proportion_now
-        q_out = q_guess + q_diff_now
+            q_diff_now = q_diff * proportion_now
+            q_out = q_guess + q_diff_now
 
-        print(f"setting joint angles {q_out}")
-        self.kinova_robot.set_joint_angles(q_out, gripper_percentage=0)
-        print(f"got to pose")
+            ee_out,_ = self.model.calc_forward_kinematics(q_out.tolist())
+            print(f"EE out, predicted: {ee_out.x}, {ee_out.y}, {ee_out.z}")
+            if ee_out.z > 0:
+                success = True
+
+                print(f"setting joint angles {q_out}, with prop {proportion_now}")
+                print(f"my joints are {self.kinova_robot.get_joint_angles()}")
+                self.kinova_robot.set_joint_angles(q_out,wait=True)
+                print(f"got to pose")
+            
+            else:
+                print(f"Tried to move into the table, will try again")
 
         # return true if we were planning to get all the way to our target
         return proportion_now >= 1.0
@@ -352,6 +372,7 @@ class Main(BaseApp):
 
     def process_frame(self):
         poses = {}
+        print(self.pixel_pts)
         ret, frame = self.cap.read()
         if not ret:
             return False,poses
@@ -377,6 +398,7 @@ class Main(BaseApp):
                     np.float32(pixel_mat),
                     np.float32(robot_mat)
                 )
+                print(f"Got affine matrix")
 
         # Ok, so we now have our affine matrix, this will be used to go from pixel to robot frame
         # To extract pixels, we make a color mask
@@ -438,7 +460,7 @@ if __name__ == "__main__":
     print(sys.argv)
     if len(sys.argv) > 1:
         video_num = int(sys.argv[1])
-    final_project = Main(simulate=True, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=video_num)
+    final_project = Main(simulate=False, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=video_num)
 
 
     try:
