@@ -5,11 +5,13 @@ import numpy as np
 from kinova_lite_kinematics_dh import KinovaLiteDH
 from utils import EndEffector, rotm_to_euler
 import sys
+import copy
 import faulthandler
+import pyrealsense2 as rs
 faulthandler.enable()
 
 STATE_SEARCH = 0
-STATE_APPROCH_TARGET = 1
+STATE_APPROACH_TARGET = 1
 STATE_GRAB = 2
 STATE_APPROACH_GOAL = 3
 STATE_RELEASE = 4
@@ -54,6 +56,8 @@ TABLE_PTS = np.array([
 ], dtype=np.float32)
 
 TAG_IDS = [4,6,7]
+
+TAG_IDS = [9,5,8]
 
 HOME_JOINTS = np.array([1.75, 5.76, 2.18, 2.44, 4.54, 0.0])
 TAG_POSITION_IN_ROBOT_FRAME = {}
@@ -103,7 +107,7 @@ class Main(BaseApp):
     """
     def __init__(self,simulate=True, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=0):
         self.cap = cv2.VideoCapture(video_device)
-        super().__init__(simulate=True, urdf_path="visualizer/6dof/urdf/6dof.urdf")
+        super().__init__(simulate=simulate, urdf_path=urdf_path)
 
     def start(self):
         """
@@ -158,12 +162,12 @@ class Main(BaseApp):
                 if detected in self.target_colors:
                     # we detected a target to go get
                     self.current_target_color = detected
-                    self.state = STATE_APPROCH_TARGET
+                    self.state = STATE_APPROACH_TARGET
                     print(f"Entering STATE_APPROACH_TARGET state")
                     self.last_known_target_pose = poses[detected]
                     return
                 
-        elif self.state == STATE_APPROCH_TARGET:
+        elif self.state == STATE_APPROACH_TARGET:
             ret,poses = self.process_frame()
             detected_colors = poses.keys()
             if self.current_target_color not in detected_colors:
@@ -194,7 +198,7 @@ class Main(BaseApp):
                 self.state = STATE_GRAB
 
                 # get rid of the offset we enforce in the approach
-                target_pose_shifted = target_pose
+                target_pose_shifted = copy.copy(target_pose) # copy it here
                 target_pose_shifted.z = target_pose.z - APPROACH_Z_OFFSET
                 self.grab_ee_target = target_pose_shifted
                 print(f"Entering STATE_GRAB state")
@@ -212,15 +216,23 @@ class Main(BaseApp):
             print(f"Entering STATE_APPROACH_GOAL state")
             
         elif self.state == STATE_APPROACH_GOAL:
+            if self.last_known_goal_pose is None:
+                print(f"We haven't found the goal!")
+                return
             # We've grabbed the target block, now we can go to the goal
             ret,poses = self.process_frame()
-            detected_ids = poses.keys()
-            if self.goal_id in detected_ids:
-                self.last_known_goal_pose = poses[self.goal_id]
+            detected_colors = poses.keys()
+            if self.goal_color in detected_colors:
+                self.last_known_goal_pose = poses[self.goal_color]
             
             # Map OpenCV output in the camera frame to position in the world frame
-            pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_goal_pose[1],rvecs=self.last_known_goal_pose[0])
-            goal_pose = self.get_approach_pose(pose_robot_frame)
+            #pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_goal_pose[1],rvecs=self.last_known_goal_pose[0])
+            goal_pose = EndEffector()
+            goal_pose.rotx = goal_pose.roty = goal_pose.rotz = 0
+            goal_pose.z = 0.15
+            goal_pose.x = self.last_known_goal_pose[0]
+            goal_pose.y = self.last_known_goal_pose[1]
+            goal_pose = self.get_approach_pose(goal_pose)
 
             # go towards the target pose
             ## TODO we don't want to match the pose exactly --- instead be looking downwards, and target slightly above it
@@ -242,15 +254,15 @@ class Main(BaseApp):
             self.kinova_robot.open_gripper()
 
             # Our old goal is covered, our new goal (if stacking multiple blocks) is our earlier target
-            self.goal_id = self.current_target_id
-            self.target_ids.remove(self.current_target_id)
+            self.goal_color = self.current_target_color
+            self.target_colors.remove(self.current_target_color)
 
             ### TODO make the robot retreat a bit, go to some neutral position 
-            shifted_goal = self.grab_ee_target
+            shifted_goal = copy.copy(self.grab_ee_target)
             shifted_goal.z += APPROACH_Z_OFFSET
 
             q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
-            q_sol = self.model.calc_inverse_kinematics(self.grab_ee_target, q_guess=q_guess)
+            q_sol = self.model.calc_inverse_kinematics(shifted_goal, q_guess=q_guess)
             q_sol = np.asarray(q_sol, dtype=float)
             self.kinova_robot.set_joint_angles(q_sol)
 
@@ -278,10 +290,10 @@ class Main(BaseApp):
 
         q_diff = q_sol - q_guess
         q_diff = np.mod(q_diff, 2*np.pi)
-        q_diff = np.where(q_diff > np.pi, -1*(q_diff + np.pi), q_diff)
+        q_diff = np.where(q_diff > np.pi, q_diff - 2*np.pi, q_diff)
 
         mag_max_change = np.max(np.abs(q_diff))
-        proportion_now = max_rad / mag_max_change # proportion of the total trajectory to do at once
+        proportion_now = max_rad / (1e-5 + mag_max_change) # proportion of the total trajectory to do at once
         proportion_now = min(1.0, proportion_now)
 
         q_diff_now = q_diff * proportion_now
@@ -341,9 +353,9 @@ class Main(BaseApp):
     def process_frame(self):
         poses = {}
         ret, frame = self.cap.read()
-        img_clone = frame.copy()
         if not ret:
             return False,poses
+        img_clone = frame.copy()
 
         # Calling the detect markers
         corners, ids, rejected = self.detector.detectMarkers(frame)
@@ -359,9 +371,11 @@ class Main(BaseApp):
                     self.robot_pts[tag_id] = TAG_POSITIONS_IN_ROBOT_FRAME[tag_id]
 
             if len(self.pixel_pts) >= 3:
+                pixel_mat = np.vstack([self.pixel_pts[TAG_IDS[0]],self.pixel_pts[TAG_IDS[1]],self.pixel_pts[TAG_IDS[2]]])
+                robot_mat = np.vstack([self.robot_pts[TAG_IDS[0]],self.robot_pts[TAG_IDS[1]],self.robot_pts[TAG_IDS[2]]])
                 affine_matrix = cv2.getAffineTransform( # 2 x 3 (pixels to xy)
-                    np.float32(self.pixel_pts[:3]),
-                    np.float32(self.robot_pts[:3])
+                    np.float32(pixel_mat),
+                    np.float32(robot_mat)
                 )
 
         # Ok, so we now have our affine matrix, this will be used to go from pixel to robot frame
