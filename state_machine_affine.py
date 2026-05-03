@@ -25,6 +25,7 @@ green_lower = np.array([50, 80, 100])
 green_upper = np.array([89, 255, 255])
 
 APPROACH_Z_OFFSET = 0.07
+RECOMPUTE_IK_TOLERANCE = 0.01
 
 # Camera needs a moment to settle exposure/white-balance on startup.
 # During warmup we still show the frame, but ignore detections.
@@ -63,8 +64,8 @@ TAG_IDS = [4,6,7]
 TAG_POSITION_IN_ROBOT_FRAME = {}
 
 TAG_POSITIONS_IN_ROBOT_FRAME = {
-    4: np.array([0.405, 0.0], dtype=np.float32),
-    6: np.array([0.405, -0.42], dtype=np.float32),
+    4: np.array([0.395, 0.0], dtype=np.float32),
+    6: np.array([0.395, -0.42], dtype=np.float32),
     7: np.array([0.0,  -0.42], dtype=np.float32)
 }
 
@@ -169,6 +170,8 @@ class Main(BaseApp):
         self.kinova_robot.set_joint_angles(HOME_POSITION, gripper_percentage=0)
 
         self.count_stacked = 0
+        self.last_IK_joint_target = None
+        self.last_IK_target_pose = None
     
     def loop(self):
         if self.state == STATE_SEARCH:
@@ -204,6 +207,15 @@ class Main(BaseApp):
 
             # Map OpenCV output in the camera frame to position in the world frame
             # pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_target_pose[1],rvecs=self.last_known_target_pose[0])
+            
+            if self.last_IK_target_pose is not None:
+                diff_x = self.last_IK_target_pose[0] - self.last_known_target_pose[0]
+                diff_y = self.last_IK_target_pose[1] - self.last_known_target_pose[1]
+                if diff_x ** 2 + diff_y ** 2 > RECOMPUTE_IK_TOLERANCE ** 2:
+                    # our target has moved
+                    self.last_IK_target_pose = self.last_known_target_pose
+                    self.last_IK_joint_target = None # we need to recompute IK
+
             target_pose = EndEffector()
             target_pose.rotx = target_pose.roty = target_pose.rotz = 0
             target_pose.z = -0.01
@@ -254,6 +266,14 @@ class Main(BaseApp):
             
             # Map OpenCV output in the camera frame to position in the world frame
             #pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_goal_pose[1],rvecs=self.last_known_goal_pose[0])
+            if self.last_IK_target_pose is not None:
+                diff_x = self.last_IK_target_pose[0] - self.last_known_target_pose[0]
+                diff_y = self.last_IK_target_pose[1] - self.last_known_target_pose[1]
+                if diff_x ** 2 + diff_y ** 2 > RECOMPUTE_IK_TOLERANCE ** 2:
+                    # our target has moved
+                    self.last_IK_target_pose = self.last_known_target_pose
+                    self.last_IK_joint_target = None # we need to recompute IK
+
             goal_pose = EndEffector()
             goal_pose.rotx = goal_pose.roty = goal_pose.rotz = 0
             goal_pose.z = 0.025 + self.count_stacked * 0.025
@@ -270,6 +290,8 @@ class Main(BaseApp):
                 # we reached our target (the block)
                 target_pose_shifted = goal_pose
                 target_pose_shifted.z = goal_pose.z - APPROACH_Z_OFFSET
+                self.last_IK_joint_target = None
+                self.last_IK_target_pose = None
                 self.grab_ee_target = target_pose_shifted
                 self.state = STATE_RELEASE
                 print(f"Entering STATE_RELEASE state")
@@ -318,14 +340,18 @@ class Main(BaseApp):
         success = False
         while not success:
             target = pose
-
             # Hardware returns angles that may be in [0, 2pi). Normalize to [-pi, pi]
             # so IK and shortest-path stepping stay continuous.
             q_meas = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
             q_guess = _wrap_to_pi(q_meas)
 
-            q_sol = self.model.calc_inverse_kinematics(target, q_guess=q_guess)
-            q_sol = _wrap_to_pi(np.asarray(q_sol, dtype=float))
+            if self.last_IK_joint_target is None:
+                q_sol = self.model.calc_inverse_kinematics(target, q_guess=q_guess)
+                q_sol = _wrap_to_pi(np.asarray(q_sol, dtype=float))
+
+                self.last_IK_joint_target = q_sol # target joint vals for IK solution
+            else:
+                q_sol = self.last_IK_joint_target
 
             q_diff = _shortest_angle_diff(q_sol, q_guess)
 
@@ -496,7 +522,7 @@ if __name__ == "__main__":
     #     cv2.imshow("frame",frame)
     #     if cv2.waitKey(1) & 0xFF == ord('q'):
     #         pass
-    video_num = 0
+    video_num = 8
     print(sys.argv)
     if len(sys.argv) > 1:
         video_num = int(sys.argv[1])
