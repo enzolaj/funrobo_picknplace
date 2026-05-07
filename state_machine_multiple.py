@@ -7,7 +7,8 @@ from utils import EndEffector, rotm_to_euler
 import sys
 import copy
 import faulthandler
-import pyrealsense2 as pyrs
+import pyrealsense2 as rs
+import time
 faulthandler.enable()
 
 STATE_SEARCH = 0
@@ -19,6 +20,8 @@ STATE_STOP = 5
 
 red_lower = np.array([0, 100, 100])
 red_upper = np.array([10, 255, 255])
+red_lower_2 = np.array([245, 100, 100])
+red_upper_2 = np.array([255, 255, 255])
 blue_lower = np.array([90, 100, 150]) 
 blue_upper = np.array([115, 255, 255])
 green_lower = np.array([50, 80, 100]) 
@@ -26,6 +29,7 @@ green_upper = np.array([89, 255, 255])
 
 APPROACH_Z_OFFSET = 0.07
 RECOMPUTE_IK_TOLERANCE = 0.01
+MAX_JOINT_STEP = 0.3
 
 # Camera needs a moment to settle exposure/white-balance on startup.
 # During warmup we still show the frame, but ignore detections.
@@ -55,7 +59,7 @@ H_TAG_TO_BLOCK_CENTER = np.array([
     [0,0,0,1],
 ])
 
-HOME_POSITION = np.array([1.25, 5.76, 2.18, 2.44, 4.54, 0.0])
+HOME_POSITION = np.array([1.25, 5.76, 2.18, 2.44, 2.54, 0.0])
 
 TAG_IDS = [4,6,7]
 
@@ -64,9 +68,9 @@ TAG_IDS = [4,6,7]
 TAG_POSITION_IN_ROBOT_FRAME = {}
 
 TAG_POSITIONS_IN_ROBOT_FRAME = {
-    4: np.array([0.39, 0.0], dtype=np.float32),
+    4: np.array([0.39, 0], dtype=np.float32),
     6: np.array([0.39, -0.415], dtype=np.float32),
-    7: np.array([-0.015,  -0.415], dtype=np.float32)
+    7: np.array([-.015,  -0.415], dtype=np.float32)
 }
 
 
@@ -99,7 +103,7 @@ def get_robot_coords(mask, affine_matrix):
     locations = []
     for contour in contours:
         # Filter by area to avoid noise
-        if cv2.contourArea(contour) > 200:
+        if cv2.contourArea(contour) > 100:
             # Calculate the center of the blob
             # Moments count the pixels present in the image
             # m00 = sum of all pixels in the image
@@ -119,15 +123,66 @@ def get_robot_coords(mask, affine_matrix):
                 locations.append(robot_coords)
     return locations
 
+def next_block_pos(tower_type,origin_x,origin_y,size,side_len=0.0254,offset=0.0):
+    """
+    Gets the next position to place a block, given the base of the tower and how many are already placed
+
+    Args:
+        tower_type: "tower" or "triangle", the type of shape to make
+        origin_x,origin_y (float): origin of the tower (position of the goal block)
+        size (int): index of the current block. Should be 0 for the goal, 1 for the first block, etc
+        side_len (float): side length of the blocks, in meters
+        offset (float): bias applied to the Z positions to drop blocks at 
+
+    Returns:
+        An EndEffector object containing the desired pose for the block
+    """
+    ee_out = EndEffector()
+    ee_out.rotx = ee_out.roty = 0
+    ee_out.rotz = np.pi/2
+    if tower_type == "tower":
+        ee_out.x = origin_x
+        ee_out.y = origin_y
+        ee_out.z = offset + side_len * size
+
+        x_min = origin_x - side_len * 2
+        x_max = origin_x + side_len * 2
+        y_min = origin_y - side_len * 2
+        y_max = origin_y + side_len * 2
+
+    if tower_type == "triangle":
+        spacing = 0.002
+        
+        row = 0
+        block_total = 0
+        while block_total <= size:
+            row += 1
+            block_total += row
+        
+        blocks_in_prev = block_total - row
+        index_in_row = size - blocks_in_prev
+
+        ee_out.z = offset + side_len * index_in_row
+        ee_out.x = origin_x
+        ee_out.y = origin_y + (row - 1) * (side_len + spacing) - index_in_row * 0.5 * (side_len + spacing)
+        
+        x_min = origin_x - side_len * 2
+        x_max = origin_x + side_len * 2
+        y_min = origin_y - side_len * 2
+        y_max = ee_out.y + side_len * 2
+
+        print(f"Triangle: row {row}, index in row {index_in_row}, ")
+
+    tower_bounds = [x_min,x_max,y_min,y_max]
+    return ee_out,tower_bounds
+
+
 class Main(BaseApp):
     """
     
     """
-    def __init__(self,simulate=False, urdf_path="visualizer/6dof/urdf/6dof.urdf"):
-        self.pipeline = pyrs.pipeline()
-        self.config = pyrs.config()
-        self.config.enable_stream(pyrs.stream.color, 1920, 1080, pyrs.format.bgr8, 30)
-        self.pipeline.start(self.config)
+    def __init__(self,simulate=False, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=0):
+        self.cap = cv2.VideoCapture(video_device)
         super().__init__(simulate=simulate, urdf_path=urdf_path)
 
     def start(self):
@@ -175,8 +230,12 @@ class Main(BaseApp):
         self.count_stacked = 0
         self.last_IK_joint_target = None
         self.last_IK_target_pose = None
+
+        self.tower_origin = None
+        self.tower_footprint = None
     
     def loop(self):
+        ret,poses = self.process_frame()
         if self.state == STATE_SEARCH:
             # Look for the target block position 
             # Approach it once we find it 
@@ -186,40 +245,56 @@ class Main(BaseApp):
                 return
             #print(f"poses: {poses}")
             print(poses.keys())
-            detected_colors = poses.keys()
-            for detected in detected_colors:
-                if detected in self.target_colors:
-                    # we detected a target to go get
+            for detected in poses.keys():
+                if detected not in self.target_colors:
+                    continue
+
+                for pose in poses[detected]:
+                    if self.tower_footprint is not None:
+                        inside_tower = (
+                            self.tower_footprint[0] <= pose[0] <= self.tower_footprint[1] and
+                            self.tower_footprint[2] <= pose[1] <= self.tower_footprint[3]
+                        )
+                        if inside_tower:
+                            continue
+
                     self.current_target_color = detected
                     self.state = STATE_APPROACH_TARGET
-                    print(f"Entering STATE_APPROACH_TARGET state")
-                    self.last_known_target_pose = poses[detected]
+                    self.last_known_target_pose = pose
+                    self.last_IK_target_pose = None
+                    self.last_IK_joint_target = None
+                    print("Entering STATE_APPROACH_TARGET state")
                     return
-                
+                    
         elif self.state == STATE_APPROACH_TARGET:
             ret,poses = self.process_frame()
             detected_colors = poses.keys()
-            if self.current_target_color not in detected_colors:
-                # we lost the target! can't see it anymore
-                # TODO maybe do something here? 
-                pass
             
-            if self.current_target_color in detected_colors:
-                # update target pose
-                self.last_known_target_pose = poses[self.current_target_color]
+            if self.current_target_color in detected_colors and self.last_IK_target_pose is not None:
+                # See if the block has moved (in other words, see if there's still a valid block where we expect)
+                best_pose = None
+                best_dist = None
+                for pose in poses[self.current_target_color]:
+                    diff_x = self.last_IK_target_pose[0] - pose[0]
+                    diff_y = self.last_IK_target_pose[1] - pose[1]
+                    dist = diff_x ** 2 + diff_y ** 2
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        best_pose = pose
 
-            # Map OpenCV output in the camera frame to position in the world frame
-            # pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_target_pose[1],rvecs=self.last_known_target_pose[0])
-            
-            if self.last_IK_target_pose is not None:
-                diff_x = self.last_IK_target_pose[0] - self.last_known_target_pose[0]
-                diff_y = self.last_IK_target_pose[1] - self.last_known_target_pose[1]
-                if diff_x ** 2 + diff_y ** 2 > RECOMPUTE_IK_TOLERANCE ** 2:
+                if best_dist is None or best_dist > RECOMPUTE_IK_TOLERANCE ** 2:
                     # our target has moved
-                    self.last_IK_target_pose = self.last_known_target_pose
-                    self.last_IK_joint_target = None # we need to recompute IK
-                    print(f"Our target has moved, recomputing IK")
+                    self.last_IK_target_pose = best_pose
+                    self.last_IK_joint_target = None
+                    self.last_known_target_pose = best_pose
 
+            if self.last_known_target_pose is None:
+                print("No valid target pose; returning to search")
+                self.state = STATE_SEARCH
+                self.last_IK_joint_target = None
+                self.last_IK_target_pose = None
+                return
+            
             target_pose = EndEffector()
             target_pose.rotx = target_pose.roty = target_pose.rotz = 0
             target_pose.z = -0.01
@@ -231,12 +306,10 @@ class Main(BaseApp):
             #return # comment out to make it run
 
             # go towards the target pose
-            at_target = self.go_towards_pose(target_pose, .3)
+            at_target = self.go_towards_pose(target_pose, MAX_JOINT_STEP)
             if at_target:
                 # we reached our target (the block)
                 self.state = STATE_GRAB
-                self.last_IK_joint_target = None
-                self.last_IK_target_pose = None
 
                 # get rid of the offset we enforce in the approach
                 target_pose_shifted = copy.copy(target_pose) # copy it here
@@ -256,6 +329,14 @@ class Main(BaseApp):
 
             self.grab_ee_target = copy.copy(self.grab_ee_target)
             self.grab_ee_target.z += APPROACH_Z_OFFSET
+
+            q_guess = np.array(self.kinova_robot.get_joint_angles(), dtype=float)
+            q_sol = self.model.calc_inverse_kinematics(self.grab_ee_target, q_guess=q_guess)
+            q_sol = np.asarray(q_sol, dtype=float)
+            self.kinova_robot.set_joint_angles(q_sol)
+
+            self.last_IK_joint_target = None
+            self.last_IK_target_pose = None
             self.state = STATE_APPROACH_GOAL
             print(f"Entering STATE_APPROACH_GOAL state")
             
@@ -263,8 +344,9 @@ class Main(BaseApp):
             # We've grabbed the target block, now we can go to the goal
             ret,poses = self.process_frame()
             detected_colors = poses.keys()
-            if self.goal_color in detected_colors:
-                self.last_known_goal_pose = poses[self.goal_color]
+            # when we've already stacked a block, stop updating the origin of the tower, as it may be occluded
+            if self.goal_color in detected_colors and self.count_stacked < 1:
+                self.last_known_goal_pose = poses[self.goal_color][0]
             
             if self.last_known_goal_pose is None:
                 print(f"We haven't found the goal!")
@@ -273,25 +355,33 @@ class Main(BaseApp):
             # Map OpenCV output in the camera frame to position in the world frame
             #pose_robot_frame = self.camera_to_world_frame(tvecs=self.last_known_goal_pose[1],rvecs=self.last_known_goal_pose[0])
             if self.last_IK_target_pose is not None:
-                diff_x = self.last_IK_target_pose[0] - self.last_known_goal_pose[0]
-                diff_y = self.last_IK_target_pose[1] - self.last_known_goal_pose[1]
+                diff_x = self.last_IK_target_pose[0] - self.last_known_target_pose[0]
+                diff_y = self.last_IK_target_pose[1] - self.last_known_target_pose[1]
                 if diff_x ** 2 + diff_y ** 2 > RECOMPUTE_IK_TOLERANCE ** 2:
-                    # our goal has moved
-                    print(f"Our goal has moved, recomputing IK")
-                    self.last_IK_target_pose = self.last_known_goal_pose
+                    # our target has moved
+                    self.last_IK_target_pose = self.last_known_target_pose
                     self.last_IK_joint_target = None # we need to recompute IK
 
-            goal_pose = EndEffector()
-            goal_pose.rotx = goal_pose.roty = goal_pose.rotz = 0
-            goal_pose.z = 0.025 + self.count_stacked * 0.025
-            goal_pose.x = self.last_known_goal_pose[0]
-            goal_pose.y = self.last_known_goal_pose[1]
+            # goal_pose = EndEffector()
+            # goal_pose.rotx = goal_pose.roty = goal_pose.rotz = 0
+            # goal_pose.z = 0.025 + self.count_stacked * 0.025
+            # goal_pose.x = self.last_known_goal_pose[0]
+            # goal_pose.y = self.last_known_goal_pose[1]
+            # goal_pose = self.get_approach_pose(goal_pose)
+            # self.kinova_robot.close_gripper()
+
+            goal_pose,self.tower_footprint = next_block_pos("triangle",
+                                        self.last_known_goal_pose[0],
+                                        self.last_known_goal_pose[1],
+                                        self.count_stacked + 1,
+                                        side_len=0.0254
+                                        )
             goal_pose = self.get_approach_pose(goal_pose)
             self.kinova_robot.close_gripper()
 
             # go towards the target pose
             ## TODO we don't want to match the pose exactly --- instead be looking downwards, and target slightly above it
-            at_goal = self.go_towards_pose(goal_pose, .3)
+            at_goal = self.go_towards_pose(goal_pose, MAX_JOINT_STEP)
             
             if at_goal:
                 # we reached our target (the block)
@@ -312,10 +402,9 @@ class Main(BaseApp):
             self.kinova_robot.open_gripper()
 
             # Our old goal is covered, our new goal (if stacking multiple blocks) is our earlier target
-            self.goal_color = self.current_target_color
-            self.target_colors.remove(self.current_target_color)
+            # self.goal_color = self.current_target_color
+            # self.target_colors.remove(self.current_target_color)
 
-            ### TODO make the robot retreat a bit, go to some neutral position 
             shifted_goal = copy.copy(self.grab_ee_target)
             shifted_goal.z += APPROACH_Z_OFFSET
 
@@ -324,6 +413,8 @@ class Main(BaseApp):
             q_sol = np.asarray(q_sol, dtype=float)
             self.kinova_robot.set_joint_angles(q_sol)
             self.kinova_robot.set_joint_angles(HOME_POSITION, gripper_percentage=0)
+            self.last_IK_joint_target = None
+            self.last_IK_target_pose = None
 
             # self.state = STATE_STOP
             # print(f"Entering STATE_STOP state")
@@ -442,11 +533,9 @@ class Main(BaseApp):
     def process_frame(self):
         poses = {}
         print(self.pixel_pts)
-        frames = self.pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
+        ret, frame = self.cap.read()
+        if not ret:
             return False,poses
-        frame = np.asanyarray(color_frame.get_data())
         img_clone = frame.copy()
 
         # Warm up camera auto settings; ignore detections briefly.
@@ -481,7 +570,9 @@ class Main(BaseApp):
         # We will have a red, blue, and green mask since we need to identify and differentiate cube positions based on color
         blurred = cv2.GaussianBlur(frame, (5, 5), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        red_mask = cv2.inRange(hsv, red_lower, red_upper)
+        red_mask_1 = cv2.inRange(hsv, red_lower, red_upper)
+        red_mask_2 = cv2.inRange(hsv, red_lower_2, red_upper_2)
+        red_mask = cv2.bitwise_or(red_mask_1,red_mask_2)
         blue_mask = cv2.inRange(hsv, blue_lower, blue_upper)
         green_mask = cv2.inRange(hsv, green_lower, green_upper)
 
@@ -504,11 +595,12 @@ class Main(BaseApp):
                 # Get robot coordinates
                 coords = get_robot_coords(mask, affine_matrix)
 
+                poses[color] = []
                 for pos in coords:
                     print(f"{color} Cube at Robot Frame: X={pos[0]}m, Y={pos[1]}m")
-                    poses[color] = pos
-        cv2.namedWindow('RealSense', cv2.WINDOW_NORMAL)
-        cv2.imshow('RealSense', frame)
+                    poses[color].append(pos)
+
+        cv2.imshow("Frame", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             return True,poses
 
@@ -536,7 +628,7 @@ if __name__ == "__main__":
     print(sys.argv)
     if len(sys.argv) > 1:
         video_num = int(sys.argv[1])
-    final_project = Main(simulate=False, urdf_path="visualizer/6dof/urdf/6dof.urdf")
+    final_project = Main(simulate=False, urdf_path="visualizer/6dof/urdf/6dof.urdf", video_device=video_num)
 
 
     try:
