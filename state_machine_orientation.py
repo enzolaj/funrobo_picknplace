@@ -63,8 +63,6 @@ HOME_POSITION = np.array([1.25, 5.76, 2.18, 2.44, 2.54, 0.0])
 
 TAG_IDS = [4,6,7]
 
-#TAG_IDS = [9,5,8]
-
 TAG_POSITION_IN_ROBOT_FRAME = {}
 
 TAG_POSITIONS_IN_ROBOT_FRAME = {
@@ -89,12 +87,6 @@ def _clip_to_limits(q: np.ndarray, joint_limits) -> np.ndarray:
     if limits.shape != (6, 2):
         return q
     return np.clip(q, limits[:, 0], limits[:, 1])
-
-#TAG_POSITIONS_IN_ROBOT_FRAME = {
-##    9: np.array([0.262, -0.057], dtype=np.float32),
-#   5: np.array([-.21, -0.057], dtype=np.float32),
-#    8: np.array([-.21,  -.415], dtype=np.float32)
-#}
 
 def get_robot_poses(mask, affine_matrix):
     # Find shapes in the mask
@@ -191,7 +183,8 @@ def next_block_pos(tower_type,origin_x,origin_y,theta,size,side_len=0.0254,offse
         y_min = origin_y - side_len * 2
         y_max = ee_out.y + side_len * 2
 
-        print(f"Triangle: row {row}, index in row {index_in_row}, ")
+        if DO_LOGGING:
+            print(f"Triangle: row {row}, index in row {index_in_row}, ")
 
     # Account for rotation
     rot_mat = np.array([
@@ -325,7 +318,8 @@ class Main(BaseApp):
                     }
 
             if self.last_known_target_pose is None:
-                print("No valid target pose; returning to search")
+                if DO_LOGGING:
+                    print("No valid target pose; returning to search")
                 self.state = STATE_SEARCH
                 self.last_IK_joint_target = None
                 self.last_IK_target_pose = None
@@ -339,8 +333,8 @@ class Main(BaseApp):
             target_pose.y = self.last_known_target_pose['xy'][1]
 
             target_pose = self.get_approach_pose(target_pose)
-            print(f"Trying to go to {self.current_target_color} at {target_pose.x: .4f}, {target_pose.y: .4f}, {target_pose.z: .4f}")
-            #return # comment out to make it run
+            if DO_LOGGING:
+                print(f"Trying to go to {self.current_target_color} at {target_pose.x: .4f}, {target_pose.y: .4f}, {target_pose.z: .4f}")
 
             # go towards the target pose
             at_target = self.go_towards_pose(target_pose, MAX_JOINT_STEP)
@@ -392,7 +386,8 @@ class Main(BaseApp):
                 }
 
             if self.last_known_goal_pose is None:
-                print(f"We haven't found the goal!")
+                if DO_LOGGING:
+                    print(f"We haven't found the goal!")
                 return
             
             # Map OpenCV output in the camera frame to position in the world frame
@@ -404,14 +399,6 @@ class Main(BaseApp):
                     # our target has moved
                     self.last_IK_target_pose = self.last_known_goal_pose["xy"].copy()
                     self.last_IK_joint_target = None # we need to recompute IK
-
-            # goal_pose = EndEffector()
-            # goal_pose.rotx = goal_pose.roty = goal_pose.rotz = 0
-            # goal_pose.z = 0.025 + self.count_stacked * 0.025
-            # goal_pose.x = self.last_known_goal_pose[0]
-            # goal_pose.y = self.last_known_goal_pose[1]
-            # goal_pose = self.get_approach_pose(goal_pose)
-            # self.kinova_robot.close_gripper()
 
             goal_pose,self.tower_footprint = next_block_pos("triangle",
                                         self.last_known_goal_pose['xy'][0],
@@ -473,13 +460,6 @@ class Main(BaseApp):
         """
         Move a small amount towards a given pose in joint space
         """
-        #return 0
-        #target_pos = pose[0]
-        #target_rpy = pose[1]
-
-        #target = EndEffector() # Make end effector object
-        #target.x, target.y, target.z = target_pos
-        #target.rotx, target.roty, target.rotz = target_rpy
         success = False
         while not success:
             target = pose
@@ -508,17 +488,21 @@ class Main(BaseApp):
             q_out = _clip_to_limits(q_out, getattr(self.model, "joint_limits", None))
 
             ee_out,_ = self.model.calc_forward_kinematics(q_out.tolist())
-            print(f"EE out, predicted: {ee_out.x}, {ee_out.y}, {ee_out.z}")
+            if DO_LOGGING:
+                print(f"EE out, predicted: {ee_out.x}, {ee_out.y}, {ee_out.z}")
             if ee_out.z > 0:
                 success = True
 
-                print(f"setting joint angles {q_out}, with prop {proportion_now}")
-                print(f"my joints are {self.kinova_robot.get_joint_angles()}")
+                if DO_LOGGING:
+                    print(f"setting joint angles {q_out}, with prop {proportion_now}")
+                    print(f"my joints are {self.kinova_robot.get_joint_angles()}")
                 self.kinova_robot.set_joint_angles(q_out, wait=True)
-                print(f"got to pose")
+                if DO_LOGGING:
+                    print(f"got to pose")
             
             else:
-                print(f"Tried to move into the table, will try again")
+                if DO_LOGGING:
+                    print(f"Tried to move into the table, will try again")
 
         # Only treat as "at target" if the *measured* robot state is close.
         # The physical backend unblocks on ACTION_ABORT as well as ACTION_END,
@@ -577,7 +561,8 @@ class Main(BaseApp):
 
     def process_frame(self):
         poses = {}
-        print(self.pixel_pts)
+        if DO_LOGGING:
+            print(self.pixel_pts)
         ret, frame = self.cap.read()
         if not ret:
             return False,poses
@@ -608,7 +593,8 @@ class Main(BaseApp):
                     np.float32(pixel_mat),
                     np.float32(robot_mat)
                 )
-                print(f"Got affine matrix")
+                if DO_LOGGING:
+                    print(f"Got affine matrix")
 
         # Ok, so we now have our affine matrix, this will be used to go from pixel to robot frame
         # To extract pixels, we make a color mask
@@ -640,7 +626,8 @@ class Main(BaseApp):
                 # Get robot coordinates
                 poses[color] = get_robot_poses(mask, affine_matrix)
                 for val in poses[color]:
-                    print(f"{color} Cube at Robot Frame: X={val['xy'][0]}m, Y={val['xy'][1]}m. theta: {val['theta']}")
+                    if DO_LOGGING:
+                        print(f"{color} Cube at Robot Frame: X={val['xy'][0]}m, Y={val['xy'][1]}m. theta: {val['theta']}")
             
             for val in poses[color]:
                 cx, cy = val["center_px"]
@@ -685,23 +672,8 @@ class Main(BaseApp):
 
 
 if __name__ == "__main__":
-    # video_num = 0
-    # print(sys.argv)
-    # if len(sys.argv) > 1:
-    #     video_num = sys.argv[1]
-    #     print(video_num)
-    # cap = cv2.VideoCapture(video_num)
-    # while True:
-    #     if not cap.isOpened():
-    #         continue
-    #     ret,frame = cap.read()
-    #     print("tried reading")
-    #     if not ret:
-    #         continue
-    #     cv2.imshow("frame",frame)
-    #     if cv2.waitKey(1) & 0xFF == ord('q'):
-    #         pass
     video_num = 8
+    DO_LOGGING = True
     print(sys.argv)
     if len(sys.argv) > 1:
         video_num = int(sys.argv[1])

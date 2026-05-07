@@ -86,12 +86,6 @@ def _clip_to_limits(q: np.ndarray, joint_limits) -> np.ndarray:
         return q
     return np.clip(q, limits[:, 0], limits[:, 1])
 
-#TAG_POSITIONS_IN_ROBOT_FRAME = {
-##    9: np.array([0.262, -0.057], dtype=np.float32),
-#   5: np.array([-.21, -0.057], dtype=np.float32),
-#    8: np.array([-.21,  -.415], dtype=np.float32)
-#}
-
 def get_robot_coords(mask, affine_matrix):
     # Find shapes in the mask
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -218,7 +212,8 @@ class Main(BaseApp):
                     # our target has moved
                     self.last_IK_target_pose = self.last_known_target_pose
                     self.last_IK_joint_target = None # we need to recompute IK
-                    print(f"Our target has moved, recomputing IK")
+                    if DO_LOGGING:
+                        print(f"Our target has moved, recomputing IK")
 
             target_pose = EndEffector()
             target_pose.rotx = target_pose.roty = target_pose.rotz = 0
@@ -227,7 +222,8 @@ class Main(BaseApp):
             target_pose.y = self.last_known_target_pose[1]
 
             target_pose = self.get_approach_pose(target_pose)
-            print(f"Trying to go to {self.current_target_color} at {target_pose.x: .4f}, {target_pose.y: .4f}, {target_pose.z: .4f}")
+            if DO_LOGGING:
+                print(f"Trying to go to {self.current_target_color} at {target_pose.x: .4f}, {target_pose.y: .4f}, {target_pose.z: .4f}")
             #return # comment out to make it run
 
             # go towards the target pose
@@ -267,7 +263,8 @@ class Main(BaseApp):
                 self.last_known_goal_pose = poses[self.goal_color]
             
             if self.last_known_goal_pose is None:
-                print(f"We haven't found the goal!")
+                if DO_LOGGING:
+                    print(f"We haven't found the goal!")
                 return
             
             # Map OpenCV output in the camera frame to position in the world frame
@@ -277,7 +274,8 @@ class Main(BaseApp):
                 diff_y = self.last_IK_target_pose[1] - self.last_known_goal_pose[1]
                 if diff_x ** 2 + diff_y ** 2 > RECOMPUTE_IK_TOLERANCE ** 2:
                     # our goal has moved
-                    print(f"Our goal has moved, recomputing IK")
+                    if DO_LOGGING:
+                        print(f"Our goal has moved, recomputing IK")
                     self.last_IK_target_pose = self.last_known_goal_pose
                     self.last_IK_joint_target = None # we need to recompute IK
 
@@ -337,13 +335,6 @@ class Main(BaseApp):
         """
         Move a small amount towards a given pose in joint space
         """
-        #return 0
-        #target_pos = pose[0]
-        #target_rpy = pose[1]
-
-        #target = EndEffector() # Make end effector object
-        #target.x, target.y, target.z = target_pos
-        #target.rotx, target.roty, target.rotz = target_rpy
         success = False
         while not success:
             target = pose
@@ -372,17 +363,20 @@ class Main(BaseApp):
             q_out = _clip_to_limits(q_out, getattr(self.model, "joint_limits", None))
 
             ee_out,_ = self.model.calc_forward_kinematics(q_out.tolist())
-            print(f"EE out, predicted: {ee_out.x}, {ee_out.y}, {ee_out.z}")
+            if DO_LOGGING:
+                print(f"EE out, predicted: {ee_out.x}, {ee_out.y}, {ee_out.z}")
             if ee_out.z > 0:
                 success = True
-
-                print(f"setting joint angles {q_out}, with prop {proportion_now}")
-                print(f"my joints are {self.kinova_robot.get_joint_angles()}")
+                if DO_LOGGING:
+                    print(f"setting joint angles {q_out}, with prop {proportion_now}")
+                    print(f"my joints are {self.kinova_robot.get_joint_angles()}")
                 self.kinova_robot.set_joint_angles(q_out, wait=True)
-                print(f"got to pose")
+                if DO_LOGGING:
+                    print(f"got to pose")
             
             else:
-                print(f"Tried to move into the table, will try again")
+                if DO_LOGGING:
+                    print(f"Tried to move into the table, will try again")
 
         # Only treat as "at target" if the *measured* robot state is close.
         # The physical backend unblocks on ACTION_ABORT as well as ACTION_END,
@@ -441,7 +435,8 @@ class Main(BaseApp):
 
     def process_frame(self):
         poses = {}
-        print(self.pixel_pts)
+        if DO_LOGGING:
+            print(self.pixel_pts)
         frames = self.pipeline.wait_for_frames()
         color_frame = frames.get_color_frame()
         if not color_frame:
@@ -474,7 +469,8 @@ class Main(BaseApp):
                     np.float32(pixel_mat),
                     np.float32(robot_mat)
                 )
-                print(f"Got affine matrix")
+                if DO_LOGGING:
+                    print(f"Got affine matrix")
 
         # Ok, so we now have our affine matrix, this will be used to go from pixel to robot frame
         # To extract pixels, we make a color mask
@@ -505,7 +501,8 @@ class Main(BaseApp):
                 coords = get_robot_coords(mask, affine_matrix)
 
                 for pos in coords:
-                    print(f"{color} Cube at Robot Frame: X={pos[0]}m, Y={pos[1]}m")
+                    if DO_LOGGING:
+                        print(f"{color} Cube at Robot Frame: X={pos[0]}m, Y={pos[1]}m")
                     poses[color] = pos
         cv2.namedWindow('RealSense', cv2.WINDOW_NORMAL)
         cv2.imshow('RealSense', frame)
@@ -516,26 +513,8 @@ class Main(BaseApp):
 
 
 if __name__ == "__main__":
-    # video_num = 0
-    # print(sys.argv)
-    # if len(sys.argv) > 1:
-    #     video_num = sys.argv[1]
-    #     print(video_num)
-    # cap = cv2.VideoCapture(video_num)
-    # while True:
-    #     if not cap.isOpened():
-    #         continue
-    #     ret,frame = cap.read()
-    #     print("tried reading")
-    #     if not ret:
-    #         continue
-    #     cv2.imshow("frame",frame)
-    #     if cv2.waitKey(1) & 0xFF == ord('q'):
-    #         pass
     video_num = 8
-    print(sys.argv)
-    if len(sys.argv) > 1:
-        video_num = int(sys.argv[1])
+    DO_LOGGING = True
     final_project = Main(simulate=False, urdf_path="visualizer/6dof/urdf/6dof.urdf")
 
 
